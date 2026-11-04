@@ -1,8 +1,8 @@
-## Interface: 120000, 11509
+## Interface: 120105, 11509, 20506, 50504, 40402, 30405, 38002, 16001
 ## Title: BuddyBars
 ## Notes: Shows XP progress bars for party members who also run BuddyBars.
 ## Author: Bobr3940
-## Version: 0.2
+## Version: 0.3
 ## SavedVariables: BuddyBarsDB
 
 BuddyBars.lua

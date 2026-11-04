@@ -1,13 +1,43 @@
+local ADDON_NAME = ...   -- the addon's folder name, supplied by the client
 local PREFIX = "BDYBARS"
-C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
 
 BuddyBarsDB = BuddyBarsDB or {}
+
+------------------------------------------------------------
+-- Compatibility shims (Retail / Classic Era / Cata / MoP)  --
+-- Every client-version-specific API is looked up here once, --
+-- with a fallback, so a Blizzard rename can't break load.   --
+------------------------------------------------------------
+local Chat = C_ChatInfo or {}
+local RegisterPrefix = Chat.RegisterAddonMessagePrefix or RegisterAddonMessagePrefix
+local SendAddon      = Chat.SendAddonMessage or SendAddonMessage
+if RegisterPrefix then pcall(RegisterPrefix, PREFIX) end
+
+-- 12.0+ "secret values": never compare, index or format one.
+local IsSecret = issecretvalue or function() return false end
+
+local PARTY_INSTANCE = (Enum and Enum.PartyCategory and Enum.PartyCategory.Instance)
+                    or LE_PARTY_CATEGORY_INSTANCE or 2
+
+-- Send results that mean "try again shortly" (throttle, or 12.0+ lockdown
+-- during boss encounters / Mythic+ / rated PvP). Built by name so it is
+-- harmless if a name doesn't exist on this client.
+local RETRY = {}
+do
+    local R = Enum and Enum.SendAddonMessageResult
+    if R then
+        for _, k in ipairs({ "AddonMessageThrottle", "ChannelThrottle", "ChatThrottle",
+                             "AddOnMessageLockdown", "AddonMessageLockdown" }) do
+            if R[k] then RETRY[R[k]] = true end
+        end
+    end
+end
 
 ------------------------------------------------------------
 -- Version checking                                       --
 ------------------------------------------------------------
 local GetMeta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
-local VERSION = GetMeta("BuddyBars", "Version") or "0"
+local VERSION = (GetMeta and GetMeta(ADDON_NAME or "BuddyBars", "Version")) or "0"
 
 local function ParseVersion(v)
     local t = {}
@@ -110,6 +140,8 @@ local function FindPartyFrame(i)
 end
 
 local function IsMaxLevel()
+    -- also treat "XP gain turned off" (Retail) like max level: nothing to show
+    if IsXPUserDisabled and IsXPUserDisabled() then return true end
     if IsPlayerAtEffectiveMaxLevel then return IsPlayerAtEffectiveMaxLevel() end
     return UnitLevel("player") >= GetMaxPlayerLevel()
 end
@@ -120,24 +152,31 @@ local function UpdateBars()
         local bar = bars[i]
         local unit = "party" .. i
         local name = UnitExists(unit) and UnitName(unit)
+        if name and IsSecret(name) then name = nil end
         local d = name and data[name]
 
         if d and d.max and d.max > 0 then
+            local xp = math.min(d.xp, d.max)
             bar:SetMinMaxValues(0, d.max)
-            bar:SetValue(d.xp)
-            bar.text:SetText(string.format("%d  -  %.0f%%", d.level, d.xp / d.max * 100))
+            bar:SetValue(xp)
+            bar.text:SetText(string.format("%d  -  %.0f%%", d.level, xp / d.max * 100))
 
-            bar:ClearAllPoints()
             local pf = FindPartyFrame(i)
-            if pf then
-                bar:SetPoint("TOPLEFT", pf, "BOTTOMLEFT", 4, 4)
-            else
-                bar:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -(stackIndex * 12) - 2)
-                stackIndex = stackIndex + 1
+            local relTo, slot = pf or anchor, pf and 0 or stackIndex
+            if not pf then stackIndex = stackIndex + 1 end
+            if bar.relTo ~= relTo or bar.slot ~= slot then
+                bar.relTo, bar.slot = relTo, slot
+                bar:ClearAllPoints()
+                if pf then
+                    bar:SetPoint("TOPLEFT", pf, "BOTTOMLEFT", 4, 4)
+                else
+                    bar:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -(slot * 12) - 2)
+                end
             end
             bar:Show()
         else
             -- no data yet, or max level: nothing to show
+            bar.relTo, bar.slot = nil, nil
             bar:Hide()
         end
     end
@@ -147,44 +186,53 @@ end
 -- Communication                                          --
 ------------------------------------------------------------
 local function GroupChannel()
-    if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+    if IsInGroup(PARTY_INSTANCE) then return "INSTANCE_CHAT" end
     if IsInGroup() then return "PARTY" end
 end
 
-local function SendMyXP()
+-- Returns nil (nothing to do), "ok", or "retry" (blocked/throttled; try later).
+local function Send(msg)
     local channel = GroupChannel()
-    if not channel then return end
+    if not channel or not SendAddon then return end
+    if Chat.InChatMessagingLockdown and Chat.InChatMessagingLockdown() then
+        return "retry"
+    end
+    local ok, result = pcall(SendAddon, PREFIX, msg, channel)
+    if not ok or result == false or RETRY[result] then return "retry" end
+    return "ok"
+end
+
+local function BuildXPMessage()
     local max = IsMaxLevel() and 0 or UnitXPMax("player")
-    local msg = string.format("XP:%d:%d:%d", UnitLevel("player"), UnitXP("player"), max)
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, channel)
+    return string.format("XP:%d:%d:%d", UnitLevel("player"), UnitXP("player"), max)
 end
 
--- Throttle so rapid XP gains (mob kills, quest turn-ins) don't spam
-local pending
-local function QueueSend()
-    if pending then return end
-    pending = true
-    C_Timer.After(1, function()
-        pending = nil
-        SendMyXP()
-    end)
+-- Coalesces bursts (mob kills, quest turn-ins) into one send, built from
+-- fresh values at send time, and retries every 5s (up to 12 times) if the
+-- client refuses the message, e.g. during a restricted encounter.
+local function MakeSender(buildMsg, delay)
+    local queued, tries = false, 0
+    local queue
+    local function fire()
+        queued = false
+        local status = Send(buildMsg())
+        if status == "retry" and tries < 12 then
+            tries = tries + 1
+            queue(5)
+        else
+            tries = 0
+        end
+    end
+    function queue(wait)
+        if queued then return end
+        queued = true
+        C_Timer.After(wait or delay, fire)
+    end
+    return queue, fire
 end
 
-local function SendVersion()
-    local channel = GroupChannel()
-    if not channel then return end
-    C_ChatInfo.SendAddonMessage(PREFIX, "VER:" .. VERSION, channel)
-end
-
-local pendingVer
-local function QueueVersion()
-    if pendingVer then return end
-    pendingVer = true
-    C_Timer.After(1.5, function()
-        pendingVer = nil
-        SendVersion()
-    end)
-end
+local QueueSend, SendMyXP = MakeSender(BuildXPMessage, 1)
+local QueueVersion = MakeSender(function() return "VER:" .. VERSION end, 1.5)
 
 ------------------------------------------------------------
 -- Events                                                 --
@@ -235,7 +283,8 @@ f:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "CHAT_MSG_ADDON" then
         local prefix, msg, _, sender = ...
-        if prefix ~= PREFIX then return end
+        if IsSecret(prefix) or IsSecret(msg) or IsSecret(sender) then return end
+        if prefix ~= PREFIX or type(msg) ~= "string" then return end
         local short = Ambiguate(sender, "short")
         if short == UnitName("player") then return end
 
@@ -252,6 +301,11 @@ f:SetScript("OnEvent", function(_, event, ...)
         end
     end
 end)
+
+-- Party frames can appear/disappear without any event we hear about (Edit
+-- Mode layout swaps, raid-style frames toggled, other UI addons), so
+-- re-check placement once a second. It's four bars; the cost is negligible.
+C_Timer.NewTicker(1, UpdateBars)
 
 ------------------------------------------------------------
 -- Slash command: /bb unlock | lock | reset               --
