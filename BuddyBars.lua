@@ -11,7 +11,8 @@ BuddyBarsDB = BuddyBarsDB or {}
 local Chat = C_ChatInfo or {}
 local RegisterPrefix = Chat.RegisterAddonMessagePrefix or RegisterAddonMessagePrefix
 local SendAddon      = Chat.SendAddonMessage or SendAddonMessage
-if RegisterPrefix then pcall(RegisterPrefix, PREFIX) end
+local prefixResult
+if RegisterPrefix then local ok, r = pcall(RegisterPrefix, PREFIX); prefixResult = ok and r or ("error: " .. tostring(r)) end
 
 -- 12.0+ "secret values": never compare, index or format one.
 local IsSecret = issecretvalue or function() return false end
@@ -140,10 +141,29 @@ local function FindPartyFrame(i)
 end
 
 local function IsMaxLevel()
-    -- also treat "XP gain turned off" (Retail) like max level: nothing to show
+    -- Nothing left to earn (or XP turned off): no bar. Don't trust any single
+    -- API here: a client that answers "max level" wrongly makes every bar vanish.
+    local xpMax = UnitXPMax("player")
+    if not xpMax or xpMax <= 0 then return true end
     if IsXPUserDisabled and IsXPUserDisabled() then return true end
+    local cap = GetMaxPlayerLevel and GetMaxPlayerLevel()
+    if cap and cap > 1 then return UnitLevel("player") >= cap end
     if IsPlayerAtEffectiveMaxLevel then return IsPlayerAtEffectiveMaxLevel() end
-    return UnitLevel("player") >= GetMaxPlayerLevel()
+    return false
+end
+
+-- Party members can be known by short name or Name-Realm depending on client.
+local function UnitKeys(unit)
+    local short = UnitName(unit)
+    if short and IsSecret(short) then return end
+    local full = GetUnitName and GetUnitName(unit, true)
+    if full and IsSecret(full) then full = nil end
+    return short, full
+end
+
+local function LookupData(unit)
+    local short, full = UnitKeys(unit)
+    return (short and data[short]) or (full and data[full]), short
 end
 
 local function UpdateBars()
@@ -151,9 +171,7 @@ local function UpdateBars()
     for i = 1, 4 do
         local bar = bars[i]
         local unit = "party" .. i
-        local name = UnitExists(unit) and UnitName(unit)
-        if name and IsSecret(name) then name = nil end
-        local d = name and data[name]
+        local d = UnitExists(unit) and LookupData(unit)
 
         if d and d.max and d.max > 0 then
             local xp = math.min(d.xp, d.max)
@@ -191,6 +209,8 @@ local function GroupChannel()
 end
 
 -- Returns nil (nothing to do), "ok", or "retry" (blocked/throttled; try later).
+local stats = { sent = 0, recv = 0, secret = 0 }
+
 local function Send(msg)
     local channel = GroupChannel()
     if not channel or not SendAddon then return end
@@ -198,7 +218,9 @@ local function Send(msg)
         return "retry"
     end
     local ok, result = pcall(SendAddon, PREFIX, msg, channel)
+    stats.lastSend, stats.lastResult = msg, ok and tostring(result) or ("error: " .. tostring(result))
     if not ok or result == false or RETRY[result] then return "retry" end
+    stats.sent = stats.sent + 1
     return "ok"
 end
 
@@ -257,8 +279,11 @@ f:SetScript("OnEvent", function(_, event, ...)
         -- drop data for people who left
         local present = {}
         for i = 1, 4 do
-            local n = UnitExists("party" .. i) and UnitName("party" .. i)
-            if n then present[n] = true end
+            if UnitExists("party" .. i) then
+                local a, b = UnitKeys("party" .. i)
+                if a then present[a] = true end
+                if b then present[b] = true end
+            end
         end
         for n in pairs(data) do
             if not present[n] then data[n] = nil end
@@ -283,10 +308,15 @@ f:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "CHAT_MSG_ADDON" then
         local prefix, msg, _, sender = ...
-        if IsSecret(prefix) or IsSecret(msg) or IsSecret(sender) then return end
+        if IsSecret(prefix) or IsSecret(msg) or IsSecret(sender) then
+            stats.secret = stats.secret + 1
+            return
+        end
         if prefix ~= PREFIX or type(msg) ~= "string" then return end
+        stats.recv, stats.lastFrom, stats.lastMsg = stats.recv + 1, sender, msg
         local short = Ambiguate(sender, "short")
         if short == UnitName("player") then return end
+        local long = Ambiguate(sender, "none")
 
         local theirVersion = msg:match("^VER:([%d%.]+)$")
         if theirVersion then
@@ -296,7 +326,9 @@ f:SetScript("OnEvent", function(_, event, ...)
 
         local level, xp, max = msg:match("^XP:(%d+):(%d+):(%d+)$")
         if level then
-            data[short] = { level = tonumber(level), xp = tonumber(xp), max = tonumber(max) }
+            local entry = { level = tonumber(level), xp = tonumber(xp), max = tonumber(max) }
+            data[short] = entry
+            data[long] = entry
             UpdateBars()
         end
     end
@@ -326,7 +358,34 @@ SlashCmdList["BUDDYBARS"] = function(arg)
         BuddyBarsDB.pos = nil
         RestorePosition()
         print("BuddyBars: position reset.")
+    elseif arg == "debug" then
+        local p = function(...) print("|cff66ccffBB|r", ...) end
+        local ver, build, _, iface = GetBuildInfo()
+        p("addon", VERSION, "| client", ver, build, "interface", iface)
+        p("prefix register:", tostring(prefixResult), "| group:", tostring(IsInGroup()),
+          "| channel:", tostring(GroupChannel()))
+        p("lockdown:", Chat.InChatMessagingLockdown and tostring(Chat.InChatMessagingLockdown()) or "n/a")
+        p("sent ok:", stats.sent, "| last:", tostring(stats.lastSend), "-> result", tostring(stats.lastResult))
+        p("received:", stats.recv, "| dropped as secret:", stats.secret,
+          "| last:", tostring(stats.lastFrom), tostring(stats.lastMsg))
+        p("me: level", UnitLevel("player"), "xp", UnitXP("player"), "/", UnitXPMax("player"),
+          "| effectiveMax", IsPlayerAtEffectiveMaxLevel and tostring(IsPlayerAtEffectiveMaxLevel()) or "n/a",
+          "| cap", GetMaxPlayerLevel and tostring(GetMaxPlayerLevel()) or "n/a",
+          "| xpDisabled", IsXPUserDisabled and tostring(IsXPUserDisabled()) or "n/a",
+          "| BuddyBars thinks max:", tostring(IsMaxLevel()))
+        for i = 1, 4 do
+            local unit = "party" .. i
+            if UnitExists(unit) then
+                local short, full = UnitKeys(unit)
+                local d = LookupData(unit)
+                local pf = FindPartyFrame(i)
+                p(unit, "name", tostring(short), "full", tostring(full),
+                  "| data", d and (d.level .. " " .. d.xp .. "/" .. d.max) or "none",
+                  "| frame", pf and (pf:GetName() or "unnamed") or "none",
+                  "| bar shown", tostring(bars[i]:IsShown()))
+            end
+        end
     else
-        print("BuddyBars: /bb unlock | lock | reset")
+        print("BuddyBars: /bb unlock | lock | reset | debug")
     end
 end

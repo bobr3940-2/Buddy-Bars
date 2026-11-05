@@ -2,7 +2,7 @@
 ## Title: BuddyBars
 ## Notes: Shows XP progress bars for party members who also run BuddyBars.
 ## Author: Bobr3940
-## Version: 0.3
+## Version: 0.4
 ## SavedVariables: BuddyBarsDB
 
 BuddyBars.lua
